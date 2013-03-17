@@ -43,6 +43,8 @@ import sys
 import re
 import cmd
 import optparse
+import collections
+import functools
 from pprint import pprint
 import sys
 import datetime
@@ -60,6 +62,31 @@ _NOT_SPECIFIED = ("Not", "Specified")
 _INCORRECT_NUM_ARGS_RE = re.compile(
     r"(takes [\w ]+ )(\d+)( arguments? \()(\d+)( given\))")
 
+class memoized(object):
+    '''Decorator. Caches a function's return value each time it is called.
+    If called later with the same arguments, the cached value is returned
+    (not reevaluated).
+    '''
+    def __init__(self, func):
+        self.func = func
+        self.cache = {}
+    def __call__(self, *args):
+        if not isinstance(args, collections.Hashable):
+            # uncacheable. a list, for instance.
+            # better to not cache than blow up.
+            return self.func(*args)
+        if args in self.cache:
+            return self.cache[args]
+        else:
+            value = self.func(*args)
+            self.cache[args] = value
+            return value
+    def __repr__(self):
+        '''Return the function's docstring.'''
+        return self.func.__doc__
+    def __get__(self, obj, objtype):
+        '''Support instance methods.'''
+        return functools.partial(self.__call__, obj)
 
 
 #---- exceptions
@@ -95,6 +122,23 @@ def alias(*aliases):
         return f
     return decorate
 
+def group(grp):
+    """Decorator to add aliases for Cmdln.do_* command handlers.
+
+    Example:
+        class MyShell(cmdln.Cmdln):
+            @cmdln.group("grpname")
+            def do_shell(self, argv):
+                #...implement 'shell' command
+    """
+    def decorate(f):
+        if not hasattr(f, "group"):
+            f.group = None
+        f.group = grp
+        #setattr(f, "group", grp)
+        return f
+    return decorate
+
 
 class RawCmdln(cmd.Cmd):
     """An improved (on cmd.Cmd) framework for building multi-subcommand
@@ -127,6 +171,9 @@ class RawCmdln(cmd.Cmd):
     unknowncmd = "unknown command: '%s'"
 
     helpindent = '' # string with which to indent help output
+
+    # {'default': {'cmds': ['cmda', 'cmdb'], 'desc': 'group's desc'}}
+    group = collections.OrderedDict([('default', {'cmds': [], 'desc': 'Commands'})])
 
     def __init__(self, completekey='tab',
                  stdin=None, stdout=None, stderr=None):
@@ -485,7 +532,8 @@ class RawCmdln(cmd.Cmd):
         return 1
 
     def do_help(self, argv):
-        """${cmd_name}: give detailed help on a specific sub-command
+        """${cmd_name}:
+            give detailed help on a specific sub-command
 
         Usage:
             ${name} help [COMMAND]
@@ -527,8 +575,9 @@ class RawCmdln(cmd.Cmd):
             doc = doc.rstrip() + '\n' # trim down trailing space
             self.stdout.write(self._str(doc))
             self.stdout.flush()
-    do_help.aliases = ["?"]
+    do_help.aliases = ["?", "h"]
 
+    @memoized
     def _help_reindent(self, help, indent=None):
         """Hook to re-indent help strings before writing to stdout.
 
@@ -557,6 +606,7 @@ class RawCmdln(cmd.Cmd):
         lines = [(indent+line).rstrip() for line in lines]
         return '\n'.join(lines)
 
+    @memoized
     def _help_preprocess(self, help, cmdname):
         """Hook to preprocess a help string before writing to stdout.
 
@@ -607,6 +657,7 @@ class RawCmdln(cmd.Cmd):
                 help = preprocessor(help, cmdname)
         return help
 
+    @memoized
     def _help_preprocess_name(self, help, cmdname=None):
         return help.replace("${name}", self.name)
 
@@ -629,21 +680,13 @@ class RawCmdln(cmd.Cmd):
         help = help.replace(indent+marker+suffix, block, 1)
         return help
 
+    @memoized
     def _get_cmds_data(self):
         # Find any aliases for commands.
-        token2canonical = self._get_canonical_map()
-        aliases = {}
-        for token, cmdname in token2canonical.items():
-            if token == cmdname: continue
-            aliases.setdefault(cmdname, []).append(token)
-
+        aliases = self._get_aliases()
         # Get the list of (non-hidden) commands and their
         # documentation, if any.
-        cmdnames = {} # use a dict to strip duplicates
-        for attr in self.get_names():
-            if attr.startswith("do_"):
-                cmdnames[attr[3:]] = True
-        cmdnames = cmdnames.keys()
+        cmdnames = self._get_cmd_names()
         cmdnames.sort()
         linedata = []
         for cmdname in cmdnames:
@@ -675,20 +718,104 @@ class RawCmdln(cmd.Cmd):
 
         return linedata
 
+    @memoized
+    def _get_cmd_names(self):
+        cmdnames = {} # use a dict to strip duplicates
+        for attr in self.get_names():
+            if attr.startswith("do_"):
+                cmdnames[attr[3:]] = True
+        cmdnames = cmdnames.keys()
+        return cmdnames
+
+    @memoized
+    def _get_groups_data(self):
+        cmdnames = self._get_cmd_names()
+        for cmdname in cmdnames:
+            try:
+                grpname = getattr(getattr(self, 'do_'+cmdname), 'group')
+            except AttributeError:
+                grpname = 'default'
+            if not self.group.has_key(grpname):
+                # auto add group
+                self.group[grpname] = {'cmds': [], 'desc': ''}
+                #raise CmdlnUserError("Group '%s' not exists." % grpname)
+            else:
+                if not self.group[grpname].has_key('cmds'):
+                    self.group[grpname]['cmds'] = []
+                if not self.group[grpname].has_key('desc'):
+                    self.group[grpname]['desc'] = 'Group %s' % grpname
+                self.group[grpname]['cmds'].append(cmdname)
+        return self.group
+
+    @memoized
+    def _get_aliases(self):
+        # Find any aliases for commands.
+        token2canonical = self._get_canonical_map()
+        aliases = {}
+        for token, cmdname in token2canonical.items():
+            if token == cmdname: continue
+            aliases.setdefault(cmdname, []).append(token)
+        return aliases
+
+    @memoized
+    def _get_group_cmds_data(self, grp):
+        aliases = self._get_aliases()
+        # Get the list of (non-hidden) commands and their
+        # documentation, if any.
+        cmdnames = self.group[grp]['cmds']
+        cmdnames.sort()
+        linedata = []
+        for cmdname in cmdnames:
+            if aliases.get(cmdname):
+                a = aliases[cmdname]
+                a.sort()
+                cmdstr = "%s (%s)" % (cmdname, ", ".join(a))
+            else:
+                cmdstr = cmdname
+            doc = None
+            try:
+                helpfunc = getattr(self, 'help_'+cmdname)
+            except AttributeError:
+                handler = self._get_cmd_handler(cmdname)
+                if handler:
+                    doc = handler.__doc__
+            else:
+                doc = helpfunc()
+
+            # Strip "${cmd_name}: " from the start of a command's doc. Best
+            # practice dictates that command help strings begin with this, but
+            # it isn't at all wanted for the command list.
+            to_strip = "${cmd_name}:"
+            if doc and doc.startswith(to_strip):
+                #log.debug("stripping %r from start of %s's help string",
+                #          to_strip, cmdname)
+                doc = doc[len(to_strip):].lstrip()
+                #
+            linedata.append( (cmdstr, doc) )
+
+        return linedata
+
+    @memoized
     def _help_preprocess_command_list(self, help, cmdname=None):
         marker = "${command_list}"
         indent, indent_width = _get_indent(marker, help)
         suffix = _get_trailing_whitespace(marker, help)
 
-        linedata = self._get_cmds_data()
-        if linedata:
-            subindent = indent + ' '*4
-            lines = _format_linedata(linedata, subindent, indent_width+4)
-            block = indent + "Commands:\n" \
-                    + '\n'.join(lines) + "\n\n"
-            help = help.replace(indent+marker+suffix, block, 1)
+        blocks = ""
+        groups = self._get_groups_data()
+        for grp in groups:
+            linedata = self._get_group_cmds_data(grp)
+            if linedata and len(linedata) > 0:
+                subindent = indent + ' '*4
+                lines = _format_linedata(linedata, subindent, indent_width+4)
+                block = indent + "%s:\n" % self.group[grp]['desc'] \
+                        + '\n'.join(lines) + "\n\n"
+                blocks += block
+
+        help = help.replace(indent+marker+suffix, blocks, 1)
         return help
 
+    @memoized
     def _gen_names_and_attrs(self):
         # Inheritance says we have to look in class and
         # base classes; order is not important.
@@ -701,6 +828,7 @@ class RawCmdln(cmd.Cmd):
             for name in dir(aclass):
                 yield (name, getattr(aclass, name))
 
+    @memoized
     def _get_help_names(self):
         """Return a mapping of help topic name to `.help_*()` method."""
         # Determine the additional help topics, if any.
@@ -713,6 +841,7 @@ class RawCmdln(cmd.Cmd):
                 help_names[help_name] = attr
         return help_names
 
+    @memoized
     def _help_preprocess_help_list(self, help, cmdname=None):
         marker = "${help_list}"
         indent, indent_width = _get_indent(marker, help)
@@ -734,6 +863,7 @@ class RawCmdln(cmd.Cmd):
         help = help.replace(indent+marker+suffix, block, 1)
         return help
 
+    @memoized
     def _help_preprocess_cmd_name(self, help, cmdname=None):
         marker = "${cmd_name}"
         handler = self._get_cmd_handler(cmdname)
@@ -750,6 +880,7 @@ class RawCmdln(cmd.Cmd):
     #TODO: this only makes sense as part of the Cmdln class.
     #      Add hooks to add help preprocessing template vars and put
     #      this one on that class.
+    @memoized
     def _help_preprocess_cmd_usage(self, help, cmdname=None):
         marker = "${cmd_usage}"
         handler = self._get_cmd_handler(cmdname)
@@ -818,6 +949,7 @@ class RawCmdln(cmd.Cmd):
     #TODO: this only makes sense as part of the Cmdln class.
     #      Add hooks to add help preprocessing template vars and put
     #      this one on that class.
+    @memoized
     def _help_preprocess_cmd_option_list(self, help, cmdname=None):
         marker = "${cmd_option_list}"
         handler = self._get_cmd_handler(cmdname)
@@ -841,10 +973,12 @@ class RawCmdln(cmd.Cmd):
         help = help.replace(indent+marker+suffix, block, 1)
         return help
 
+    @memoized
     def _get_canonical_cmd_name(self, token):
         map = self._get_canonical_map()
         return map.get(token, None)
 
+    @memoized
     def _get_canonical_map(self):
         """Return a mapping of available command names and aliases to
         their canonical command name.
@@ -875,6 +1009,7 @@ class RawCmdln(cmd.Cmd):
             setattr(self, cacheattr, token2canonical)
         return getattr(self, cacheattr)
 
+    @memoized
     def _get_cmd_handler(self, cmdname):
         handler = None
         try:
