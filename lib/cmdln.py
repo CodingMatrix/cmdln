@@ -48,7 +48,8 @@ import functools
 from pprint import pprint
 import sys
 import datetime
-
+from StringIO import StringIO
+import pager
 #---- globals
 
 LOOP_ALWAYS, LOOP_NEVER, LOOP_IF_EMPTY = range(3)
@@ -61,6 +62,40 @@ _NOT_SPECIFIED = ("Not", "Specified")
 # Python/getargs.c).
 _INCORRECT_NUM_ARGS_RE = re.compile(
     r"(takes [\w ]+ )(\d+)( arguments? \()(\d+)( given\))")
+
+def prompt(pagenum):
+    """
+    Show default prompt to continue and process keypress.
+
+    It assumes terminal/console understands carriage return \r character.
+    """
+    prompt = "\033[7m--More--(Page %s) Press 'q' to quit, press any key to continue . . . \033[0m" % pagenum
+    pager.echo(prompt)
+    ch = pager.getch()
+    pager.echo('\r' + ' '*(len(prompt)-1) + '\r')
+    if ch == 'q' or ch == 'Q':
+        return 1
+    return 0
+
+class FakeOutput(StringIO):                     # simulated output file
+    def __init__(self, fno):
+        # empty string when created
+        self.fno = fno
+        StringIO.__init__(self)
+    def fileno(self):
+        return self.fno
+    def flush(self):
+        StringIO.flush(self)
+        xs = StringIO.getvalue(self)
+        xl = len(xs.split('\n'))
+        mh = pager.getheight()
+        #print "Current content length is: %d" % (xl)
+        if xl > mh - 1:
+            pager.page(StringIO(xs), pagecallback=prompt)
+        else:
+            sys.stdout.write(xs)
+            sys.stdout.flush()
+        self.buf = ''
 
 class memoized(object):
     '''Decorator. Caches a function's return value each time it is called.
@@ -373,6 +408,7 @@ class RawCmdln(cmd.Cmd):
             if intro:
                 intro_str = self._str(intro)
                 self.stdout.write(intro_str+'\n')
+                self.stdout.flush()
             self.stop = False
             retval = None
             while not self.stop:
@@ -796,6 +832,26 @@ class RawCmdln(cmd.Cmd):
         return linedata
 
     @memoized
+    def _get_max_name_width(self, grp):
+        aliases = self._get_aliases()
+        # Get the list of (non-hidden) commands and their
+        # documentation, if any.
+        cmdnames = self.group[grp]['cmds']
+        #cmdnames.sort()
+        max_namewidth = 0
+        for cmdname in cmdnames:
+            if aliases.get(cmdname):
+                a = aliases[cmdname]
+                cmdstr = "%s (%s)" % (cmdname, ", ".join(a))
+            else:
+                cmdstr = cmdname
+            xl = len(cmdstr)
+            if xl > max_namewidth:
+                max_namewidth = xl
+
+        return max_namewidth
+
+    @memoized
     def _help_preprocess_command_list(self, help, cmdname=None):
         marker = "${command_list}"
         indent, indent_width = _get_indent(marker, help)
@@ -803,11 +859,17 @@ class RawCmdln(cmd.Cmd):
 
         blocks = ""
         groups = self._get_groups_data()
+        # we need find the max name_width
+        max_namewidth = 0
+        for grp in groups:
+            xl = self._get_max_name_width(grp)
+            if xl > max_namewidth:
+                max_namewidth = xl
         for grp in groups:
             linedata = self._get_group_cmds_data(grp)
             if linedata and len(linedata) > 0:
                 subindent = indent + ' '*4
-                lines = _format_linedata(linedata, subindent, indent_width+4)
+                lines = _format_linedata(linedata, subindent, indent_width+4, max_namewidth)
                 block = indent + "%s:\n" % self.group[grp]['desc'] \
                         + '\n'.join(lines) + "\n\n"
                 blocks += block
@@ -1044,6 +1106,23 @@ class RawCmdln(cmd.Cmd):
             pass
         else:
             return self.do_help(["help"])
+
+    def get_cmds(self):
+        aliases = self._get_aliases()
+        # Get the list of (non-hidden) commands and their
+        # documentation, if any.
+        cmdnames = self._get_cmd_names()
+        cmdnames.sort()
+        linedata = []
+        for cmdname in cmdnames:
+            if aliases.get(cmdname):
+                a = aliases[cmdname]
+                a.sort()
+                cmdx = [cmdname]+a
+            else:
+                cmdx = [cmdname]
+            linedata.append(tuple(cmdx))
+        return linedata
 
 
 #---- optparse.py extension to fix (IMO) some deficiencies
@@ -1288,6 +1367,19 @@ class Cmdln(RawCmdln):
                              "signature" % (handler.__name__, co_argcount))
 
 
+class PagingCmdln(Cmdln):
+    '''
+    This calss support paging stdout, just like pipe output to more.
+    But it's paging function default is disabled
+    '''
+
+    def __init__(self, enablepaging=False):
+        if enablepaging:
+            self._fakeout = FakeOutput(sys.stdout.fileno())
+            Cmdln.__init__(self, stdout=self._fakeout)
+        else:
+            Cmdln.__init__(self)
+
 
 #---- support for generating `man` page output from a Cmdln class
 
@@ -1384,7 +1476,7 @@ def man_sections_from_cmdln(inst, summary=None, description=None, author=None):
 
 #---- internal support functions
 
-def _format_linedata(linedata, indent, indent_width):
+def _format_linedata(linedata, indent, indent_width, max_namewidth=0):
     """Format specific linedata into a pleasant layout.
 
         "linedata" is a list of 2-tuples of the form:
@@ -1400,7 +1492,10 @@ def _format_linedata(linedata, indent, indent_width):
     SPACING = 2
     NAME_WIDTH_LOWER_BOUND = 13
     NAME_WIDTH_UPPER_BOUND = 30
-    NAME_WIDTH = max([len(s) for s,d in linedata])
+    if max_namewidth > 0:
+        NAME_WIDTH = max_namewidth
+    else:
+        NAME_WIDTH = max([len(s) for s,d in linedata])
     if NAME_WIDTH < NAME_WIDTH_LOWER_BOUND:
         NAME_WIDTH = NAME_WIDTH_LOWER_BOUND
     elif NAME_WIDTH > NAME_WIDTH_UPPER_BOUND:
