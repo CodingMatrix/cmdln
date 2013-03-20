@@ -365,6 +365,62 @@ We can now ask Conan what is best in life::
     and hear the lamentations of the women.
 
 
+Command Group and output paging 
+--------------------------------
+Let's try it: 
+    ...
+    Usage:
+        COMMAND [ARGS...]
+        help [COMMAND]
+
+    Options:
+        -h, --help  show this help message and exit
+
+    Start cmds:
+        add                 Add something.
+
+    User about cmds:
+        change              Change something.
+        ...
+    --More--(Page 1) Press 'q' to quit, press any key to continue . . . 
+    ...
+
+How to use command group? 
+
+Just add a group field and decorate cmd with @cmdln.group
+    ...
+    from collections import OrderedDict
+    class MyCmd(cmdln.Cmdln):
+        # must be OrderedDict, same order with the help's output
+        group = OrderedDict([('misc', {'desc': _('Start cmds')}),
+                         ('user', {'desc': _('User about cmds')}),
+                         ('default', {'desc': _('Other cmds')})])
+
+        def __init__(self):
+            ...
+
+        @cmdln.group('misc')
+        def do_add(self, something):
+            add_something()
+
+        @cmdln.group('user')
+        def do_change(self):
+            change_something()
+
+        ...
+    ...
+
+How to use output paging? 
+
+Just inherit from class cmdln.PagingCmdln:
+    ...
+    class MyCmd(cmdln.PagingCmdln):
+        def __init__(self):
+            cmdln.PagingCmdln.__init__(self, enablepaging=True)
+            ...
+    ...        
+
+
 TODO
 ----
 
